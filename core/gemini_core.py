@@ -76,50 +76,126 @@ class GeminiCore(BaseAgent):
         """
         Use Gemini to create a structured task plan from a natural language request.
         """
-        # This is a crucial prompt. It needs to be very clear about the available agents
-        # and the expected JSON structure.
+        
+        # --- NEW: Get current time to provide context to the model ---
+        from datetime import datetime
+        current_time = datetime.now().isoformat()
+        
+        # --- UPDATED: A more robust and detailed prompt ---
         prompt = f"""
-        You are an AI orchestrator. Your task is to break down a user's request into a sequence of steps for specialized agents to execute.
+        You are a meticulous AI orchestrator. Your task is to convert a user's natural language request into a precise JSON array of steps for specialized agents to execute. You must follow all rules exactly.
 
-        Available agents and their actions:
+        --- Rules ---
+        1.  **Current Time**: The current date and time is: {current_time}. You MUST use this as a reference for any relative times (e.g., "tomorrow", "in 1 hour", "at 2pm").
+        2.  **ISO 8601 Format**: All dates and times in the output JSON MUST be in ISO 8601 format (e.g., "2025-11-10T14:00:00").
+        3.  **Dependencies**: You MUST identify dependencies between steps.
+            * If a request involves a person's name (e.g., "Kishan", "Person B"), the FIRST step MUST be to use `contact_agent.find_contact` to get their email.
+            * Subsequent steps (like `schedule_meeting` or `send_email`) MUST then use the placeholder `"$contact_agent.email"` in their parameter list.
+        4.  **Parameter Integrity**: All parameters for an action must be correctly formatted. Do not omit required parameters.
+        5.  **Output Format**: You MUST return ONLY the raw JSON object, starting with `{{` and ending with `}}`. Do NOT include "```json", "Here is the plan:", or any other text, greetings, or explanations.
+
+        --- Available Agents and Actions ---
         - "contact_agent":
-            - "find_contact": Finds a person by name, email, SRN, or PRN. Parameters: {{"identifier": "string"}}
+            - "find_contact": Finds a person by name, email, SRN, or PRN.
+              Parameters: {{"identifier": "string"}}
+              Returns: {{"name": "...", "email": "...", "srn": "...", "prn": "..."}}
         - "calendar_agent":
-            - "schedule_meeting": Schedules a new meeting. Parameters: {{"attendees": ["email1", "email2"], "title": "string", "start_time": "ISO 8601 datetime", "end_time": "ISO 8601 datetime", "description": "string (optional)"}}
-            - "reschedule_meeting": Reschedules an existing meeting. Parameters: {{"attendee": "string", "new_start_time": "ISO 8601 datetime", "new_end_time": "ISO 8601 datetime"}}. Note: This might be ambiguous if there are multiple meetings with the attendee.
-            - "check_availability": Checks if attendees are free. Parameters: {{"attendees": ["email1", "email2"], "start_time": "ISO 8601 datetime", "end_time": "ISO 8601 datetime"}}
+            - "schedule_meeting": Schedules a new meeting.
+              Parameters: {{"attendees": ["list_of_emails"], "title": "string", "start_time": "ISO 8601 datetime", "end_time": "ISO 8601 datetime", "description": "string (optional)"}}
+            - "reschedule_meeting": Reschedules an existing meeting.
+              Parameters: {{"attendee": "string_identifier_for_contact", "new_start_time": "ISO 8601 datetime", "new_end_time": "ISO 8601 datetime"}}
+            - "check_availability": Checks if attendees are free.
+              Parameters: {{"attendees": ["list_of_emails"], "start_time": "ISO 8601 datetime", "end_time": "ISO 8601 datetime"}}
         - "email_agent":
-            - "send_email": Sends an email. Parameters: {{"recipients": ["email1", "email2"], "subject": "string", "body": "string"}}
+            - "send_email": Sends an email.
+              Parameters: {{"recipients": ["list_of_emails"], "subject": "string", "body": "string"}}
 
-        User Request: "{request}"
-
-        Create a JSON plan with an array of steps. Each step should specify the agent, action, and parameters. Steps will be executed in order.
-        If an action depends on the result of a previous step, you can note that, but for now, we'll keep it simple.
-
-        Example for "Schedule a meeting with person A tomorrow at 2 PM for project updates":
+        --- Examples (based on current time: {current_time}) ---
+        
+        User Request: "Schedule a meeting with Kishan Bhardwaj tomorrow at 2 PM for project updates. The meeting should last 1 hour."
         {{
             "steps": [
-                {{"agent": "contact_agent", "action": "find_contact", "parameters": {{"identifier": "person A"}}}},
-                {{"agent": "calendar_agent", "action": "schedule_meeting", "parameters": {{"attendees": ["$contact_agent.email"], "title": "Project Updates", "start_time": "2023-10-27T14:00:00", "end_time": "2023-10-27T15:00:00"}}}}
+                {{
+                    "agent": "contact_agent",
+                    "action": "find_contact",
+                    "parameters": {{"identifier": "Kishan Bhardwaj"}}
+                }},
+                {{
+                    "agent": "calendar_agent",
+                    "action": "schedule_meeting",
+                    "parameters": {{
+                        "attendees": ["$contact_agent.email"],
+                        "title": "Project Updates",
+                        "start_time": "[Calculated ISO 8601 for tomorrow at 2 PM]",
+                        "end_time": "[Calculated ISO 8601 for tomorrow at 3 PM]",
+                        "description": "Project updates meeting."
+                    }}
+                }}
             ]
         }}
-        Note: Use "$agent_name.result_key" to pass data between steps. For the example above, "$contact_agent.email" would be replaced by the email found in the first step.
 
-        Now, create the plan for the user's request. Return ONLY the JSON object.
+        User Request: "Email Bob Williams about the new deadline. Subject: Deadline Update. Body: Hi Bob, the new deadline is next Friday."
+        {{
+            "steps": [
+                {{
+                    "agent": "contact_agent",
+                    "action": "find_contact",
+                    "parameters": {{"identifier": "Bob Williams"}}
+                }},
+                {{
+                    "agent": "email_agent",
+                    "action": "send_email",
+                    "parameters": {{
+                        "recipients": ["$contact_agent.email"],
+                        "subject": "Deadline Update",
+                        "body": "Hi Bob, the new deadline is next Friday."
+                    }}
+                }}
+            ]
+        }}
+        
+        User Request: "Reschedule my meeting with Alice Johnson to next Monday at 10am."
+        {{
+            "steps": [
+                {{
+                    "agent": "calendar_agent",
+                    "action": "reschedule_meeting",
+                    "parameters": {{
+                        "attendee": "Alice Johnson",
+                        "new_start_time": "[Calculated ISO 8601 for next Monday at 10 AM]",
+                        "new_end_time": "[Calculated ISO 8601 for next Monday at 11 AM]"
+                    }}
+                }}
+            ]
+        }}
+
+        --- User Request ---
+        "{request}"
+
+        --- JSON Plan ---
         """
         
+        # Note: Using gemini-pro might be more reliable than gemini-2.5-flash for this complex JSON task
+        # self.model = genai.GenerativeModel('gemini-pro') 
         response = self.model.generate_content(prompt)
+        
         try:
             # Clean up the response text to ensure it's valid JSON
             response_text = response.text.strip()
+            
+            # Remove markdown fences if they still appear
             if response_text.startswith("```json"):
                 response_text = response_text[7:]
             if response_text.endswith("```"):
                 response_text = response_text[:-3]
+                
+            response_text = response_text.strip() # Final strip
+            
             return json.loads(response_text)
-        except json.JSONDecodeError as e:
-            self.logger.error(f"Failed to parse Gemini response as JSON: {response.text}. Error: {e}")
-            return {}
+        except (json.JSONDecodeError, AttributeError) as e:
+            self.logger.error(f"Failed to parse Gemini response as JSON. Error: {e}")
+            self.logger.debug(f"Raw model response text: {response.text}")
+            return {} # Return empty dict on failure
 
     async def _execute_task_plan(self, task_plan: Dict[str, Any]) -> Dict[str, Any]:
         """
