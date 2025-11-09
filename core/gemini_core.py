@@ -266,10 +266,11 @@ class GeminiCore(BaseAgent):
         for key, value in parameters.items():
             if isinstance(value, str) and value.startswith("$"):
                 # Simple placeholder replacement
-                resolved[key] = context.get(value, value) # Fallback to original if not found
+                resolved[key] = context.get(value[1:], value) # Look up key without '$'
             elif isinstance(value, list):
                 # Handle lists of placeholders
-                resolved[key] = [context.get(item, item) if isinstance(item, str) and item.startswith("$") else item for item in value]
+                # Look up each item's key without the '$'
+                resolved[key] = [context.get(item[1:], item) if isinstance(item, str) and item.startswith("$") else item for item in value]
             else:
                 resolved[key] = value
         return resolved
