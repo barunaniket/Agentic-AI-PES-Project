@@ -9,6 +9,7 @@ from typing import Dict, Any, List, Optional
 from core.base_agent import BaseAgent, AgentMessage, AgentStatus
 from integrations.google_calendar import GoogleCalendarAPI
 from config.api_keys import APIKeys
+from config.settings import TIMEZONE
 
 class CalendarAgent(BaseAgent):
     """
@@ -53,6 +54,11 @@ class CalendarAgent(BaseAgent):
             return await self._select_meeting_for_reschedule(params)
         elif action == "check_availability":
             return await self._check_availability(params)
+        elif action == "list_upcoming_meetings": # <-- ADD THIS
+            return await self._list_upcoming_meetings(params)
+        elif action == "cancel_meeting":
+            return await self._cancel_meeting(params)
+        
         else:
             return {"status": "error", "message": f"Unknown action: {action}"}
 
@@ -77,13 +83,81 @@ class CalendarAgent(BaseAgent):
             start_time=start_time,
             end_time=end_time,
             attendees=attendee_emails,
-            description=description
+            description=description,
+            timezone=TIMEZONE,
         )
 
         if event:
             return {"status": "success", "data": {"event_id": event['id'], "link": event['htmlLink']}}
         else:
             return {"status": "error", "message": "Failed to create event in Google Calendar."}
+
+    async def _cancel_meeting(self, params: Dict) -> Dict:
+        """
+        Finds and cancels a meeting based on time range and/or attendee.
+        Handles ambiguity if multiple meetings are found.
+        """
+        start_time = params.get("start_time")
+        end_time = params.get("end_time")
+        attendee_identifier = params.get("attendee") # Optional
+
+        if not start_time:
+            # We at least need a time to search
+            return {"status": "error", "message": "Missing required 'start_time' to find meeting."}
+
+        # Find meetings:
+        # If we have an attendee, search using their email (more specific)
+        search_query = None
+        if attendee_identifier:
+            email = await self._get_contact_email(attendee_identifier)
+            if email:
+                search_query = email
+
+        # Find all meetings in the specified time range
+        # We give a small buffer (e.g., 2 hours) if no end_time is given
+        if not end_time:
+            from datetime import datetime, timedelta
+            end_time_dt = datetime.fromisoformat(start_time) + timedelta(hours=2)
+            end_time = end_time_dt.isoformat()
+
+        meetings = self.calendar_api.list_events(
+            query=search_query,
+            time_min=start_time,
+            time_max=end_time
+        )
+
+        if not meetings:
+            return {"status": "error", "message": f"No meetings found matching your criteria to cancel."}
+
+        elif len(meetings) == 1:
+            # Only one meeting, proceed with deletion
+            meeting = meetings[0]
+            success = self.calendar_api.delete_event(event_id=meeting['id'])
+            if success:
+                return {"status": "success", "message": f"Successfully cancelled meeting: {meeting.get('summary', 'Untitled Meeting')}"}
+            else:
+                return {"status": "error", "message": "Failed to delete the event from Google Calendar."}
+
+        else:
+            # Multiple meetings found, ask for clarification
+            formatted_meetings = [
+                {"id": m['id'], "title": m.get('summary', 'No Title'), "start_time": m['start'].get('dateTime')} for m in meetings
+            ]
+            return {
+                "status": "ambiguous",
+                "message": f"Found multiple meetings. Please specify which one to cancel:",
+                "action_to_perform": "cancel_meeting_by_id", # We need a new follow-up action
+                "meetings": formatted_meetings
+            }
+
+    async def _list_upcoming_meetings(self, params: Dict) -> Dict:
+        """Lists all upcoming events."""
+        # We don't pass time_min so it defaults to 'now'
+        meetings = self.calendar_api.list_events() 
+        if meetings:
+            return {"status": "success", "data": {"meetings": meetings}}
+        else:
+            return {"status": "success", "message": "No upcoming meetings found."}
 
     async def _reschedule_meeting(self, params: Dict) -> Dict:
         """Initial reschedule request that checks for ambiguity."""
@@ -105,7 +179,8 @@ class CalendarAgent(BaseAgent):
             updated_event = self.calendar_api.update_event(
                 event_id=meeting['id'],
                 new_start_time=new_start_time,
-                new_end_time=new_end_time
+                new_end_time=new_end_time,
+                timezone=TIMEZONE,
             )
             if updated_event:
                 return {"status": "success", "data": {"event_id": updated_event['id'], "link": updated_event['htmlLink']}}
@@ -136,7 +211,8 @@ class CalendarAgent(BaseAgent):
         updated_event = self.calendar_api.update_event(
             event_id=meeting_id,
             new_start_time=new_start_time,
-            new_end_time=new_end_time
+            new_end_time=new_end_time,
+            timezone=TIMEZONE,
         )
         
         if updated_event:
@@ -173,6 +249,18 @@ class CalendarAgent(BaseAgent):
             if email:
                 emails.append(email)
         return emails
+
+    async def _cancel_meeting_by_id(self, params: Dict) -> Dict:
+        """Cancels a specific meeting by its ID after user selection."""
+        meeting_id = params.get("meeting_id")
+        if not meeting_id:
+            return {"status": "error", "message": "Missing 'meeting_id'."}
+
+        success = self.calendar_api.delete_event(event_id=meeting_id)
+        if success:
+            return {"status": "success", "message": f"Successfully cancelled the selected meeting."}
+        else:
+            return {"status": "error", "message": "Failed to delete the selected event."}
 
     async def _get_contact_email(self, identifier: str) -> Optional[str]:
         """Helper to ask the contact agent for an email."""

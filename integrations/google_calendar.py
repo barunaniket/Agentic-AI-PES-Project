@@ -111,8 +111,30 @@ class GoogleCalendarAPI:
         except HttpError as e:
             self.logger.error(f"An error occurred while creating the event: {e}")
             return None
+        
+    def delete_event(self, event_id: str):
+        """
+        Deletes an event from the primary calendar.
+        
+        Args:
+            event_id (str): The ID of the event to delete.
+        
+        Returns:
+            bool: True if successful, False otherwise.
+        """
+        try:
+            self.service.events().delete(
+                calendarId='primary',
+                eventId=event_id,
+                sendUpdates='all'
+            ).execute()
+            self.logger.info(f"Event deleted: {event_id}")
+            return True
+        except HttpError as e:
+            self.logger.error(f"An error occurred while deleting the event: {e}")
+            return False
 
-    def list_events(self, query: str = None, time_min: str = None, max_results: int = 10):
+    def list_events(self, query: str = None, time_min: str = None, time_max: str = None, max_results: int = 10):
         """
         Lists events from the primary calendar.
         
@@ -126,14 +148,23 @@ class GoogleCalendarAPI:
         """
         try:
             now = datetime.utcnow().isoformat() + 'Z'  # 'Z' indicates UTC time
-            events_result = self.service.events().list(
-                calendarId='primary', 
-                timeMin=time_min or now,
-                maxResults=max_results, 
-                singleEvents=True,
-                orderBy='startTime',
-                q=query
-            ).execute()
+            
+            # Build the request dictionary
+            events_list_request = {
+                'calendarId': 'primary',
+                'timeMin': time_min or now,
+                'maxResults': max_results,
+                'singleEvents': True,
+                'orderBy': 'startTime',
+                'q': query
+            }
+            
+            # Only add timeMax if it's provided
+            if time_max:
+                events_list_request['timeMax'] = time_max
+                
+            events_result = self.service.events().list(**events_list_request).execute()
+            
             events = events_result.get('items', [])
             return events
         except HttpError as e:

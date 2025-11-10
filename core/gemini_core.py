@@ -26,7 +26,8 @@ class GeminiCore(BaseAgent):
         self.model = None
         self.active_tasks = {}  # To track ongoing tasks and their responses
         self.agent_registry = AgentRegistry() # Get the singleton instance
-        
+        self.history = []
+
     async def on_start(self):
         """Initialize the Gemini model when the agent starts."""
         try:
@@ -34,6 +35,7 @@ class GeminiCore(BaseAgent):
             genai.configure(api_key=api_key)
             # Using gemini-pro for text-based tasks
             self.model = genai.GenerativeModel('gemini-2.5-flash')
+            self.chat = self.model.start_chat(history=[])
             self.logger.info("Gemini model initialized successfully.")
         except Exception as e:
             self.logger.error(f"Failed to initialize Gemini model: {e}")
@@ -52,9 +54,10 @@ class GeminiCore(BaseAgent):
             str: The final response to be shown to the user.
         """
         self.logger.info(f"Processing user request: '{request}'")
+        self.history.append({"role": "user", "parts": request})
         try:
             # Step 1: Generate a structured task plan from the user request
-            task_plan = await self._generate_task_plan(request)
+            task_plan = await self._generate_task_plan(self.history)
             self.logger.debug(f"Generated task plan: {json.dumps(task_plan, indent=2)}")
 
             if not task_plan or "steps" not in task_plan:
@@ -64,35 +67,51 @@ class GeminiCore(BaseAgent):
             execution_results = await self._execute_task_plan(task_plan)
 
             # Step 3: Generate a natural language response based on the results
-            final_response = await self._generate_response(request, execution_results)
-            
+            final_response = await self._generate_response(self.history, execution_results)
+            self.history.append({"role": "model", "parts": final_response})
             return final_response
 
         except Exception as e:
             self.logger.error(f"Error processing user request: {e}", exc_info=True)
-            return f"An unexpected error occurred: {str(e)}"
+            response = f"An unexpected error occurred: {str(e)}"
+            self.history.append({{"role": "model", "parts": response}}) # <--- ADD THIS
+            return response
 
-    async def _generate_task_plan(self, request: str) -> Dict[str, Any]:
+    async def _generate_task_plan(self, history: List[Dict[str, str]]) -> Dict[str, Any]:
         """
-        Use Gemini to create a structured task plan from a natural language request.
+        Use Gemini to create a structured task plan from a natural language request,
+        using the conversation history for context.
         """
         
         # --- NEW: Get current time to provide context to the model ---
         from datetime import datetime
         current_time = datetime.now().isoformat()
         
+        # --- NEW: Extract current request and format history ---
+        current_request = history[-1]["parts"]
+        # Format all messages *except* the latest one (which is the prompt)
+        formatted_history = "\n".join([f"{msg['role']}: {msg['parts']}" for msg in history[:-1]])
+
         # --- UPDATED: A more robust and detailed prompt ---
         prompt = f"""
-        You are a meticulous AI orchestrator. Your task is to convert a user's natural language request into a precise JSON array of steps for specialized agents to execute. You must follow all rules exactly.
+        You are a meticulous AI orchestrator. Your task is to convert a user's natural language request into a precise JSON array of steps for specialized agents to execute, using the conversation history as context. You must follow all rules exactly.
 
+        --- Conversation History (for context) ---
+        {formatted_history}
+        
         --- Rules ---
         1.  **Current Time**: The current date and time is: {current_time}. You MUST use this as a reference for any relative times (e.g., "tomorrow", "in 1 hour", "at 2pm").
-        2.  **ISO 8601 Format**: All dates and times in the output JSON MUST be in ISO 8601 format (e.g., "2025-11-10T14:00:00").
-        3.  **Dependencies**: You MUST identify dependencies between steps.
-            * If a request involves a person's name (e.g., "Kishan", "Person B"), the FIRST step MUST be to use `contact_agent.find_contact` to get their email.
-            * Subsequent steps (like `schedule_meeting` or `send_email`) MUST then use the placeholder `"$contact_agent.email"` in their parameter list.
+        1.5. **User Timezone**: The user's timezone is IST ('Asia/Kolkata').
+        2.  **MANDATORY UTC CONVERSION**: You MUST interpret all user times (e.g., "2pm", "tomorrow morning") in the user's timezone (IST) and then **convert them to UTC (Coordinated Universal Time)** for the final JSON output. All output times MUST be in ISO 8601 format and end with a 'Z' to signify UTC.
+            * **Example Conversion:** User says "tomorrow at 8am". IST is UTC+5:30. 8:00 AM IST is 02:30 AM UTC. The output MUST be "YYYY-MM-DDT02:30:00Z".
+            * **Example Conversion:** User says "5pm". 5:00 PM IST (17:00) is 11:30 AM UTC. The output MUST be "YYYY-MM-DDT11:30:00Z".
+        3.  **Dependencies & Placeholders**: You MUST identify dependencies.
+            * If a request involves one or more people (e.g., "Kishan", "Sehal"), you MUST create a *separate* `contact_agent.find_contact` step for *each* person.
+            * When a `find_contact` step uses an identifier like "Sehal", you MUST assume the resulting email will be available in a placeholder named `"$sehal_email"` (lowercase identifier + "_email").
+            * Subsequent steps (like `schedule_meeting` or `send_email`) MUST then use these placeholders (e.g., `"$sehal_email"`, `"$kishan_email"`) in their parameter lists.
         4.  **Parameter Integrity**: All parameters for an action must be correctly formatted. Do not omit required parameters.
-        5.  **Output Format**: You MUST return ONLY the raw JSON object, starting with `{{` and ending with `}}`. Do NOT include "```json", "Here is the plan:", or any other text, greetings, or explanations.
+        5.  **Output Format**: You MUST return ONLY the raw JSON object, starting with {{{{ and ending with }}}}. Do NOT include "```json", "Here is the plan:", or any other text, greetings, or explanations.
+        6.  **Contextual Awareness**: You MUST use the "Conversation History" to resolve ambiguous requests. For example, if the user says "reschedule it to 5pm", you must look at the history to find which meeting "it" refers to. If they say "at the same time", you must find the original time.
 
         --- Available Agents and Actions ---
         - "contact_agent":
@@ -102,10 +121,14 @@ class GeminiCore(BaseAgent):
         - "calendar_agent":
             - "schedule_meeting": Schedules a new meeting.
               Parameters: {{"attendees": ["list_of_emails"], "title": "string", "start_time": "ISO 8601 datetime", "end_time": "ISO 8601 datetime", "description": "string (optional)"}}
-            - "reschedule_meeting": Reschedules an existing meeting.
-              Parameters: {{"attendee": "string_identifier_for_contact", "new_start_time": "ISO 8601 datetime", "new_end_time": "ISO 8601 datetime"}}
+            - "reschedule_meeting": Reschedules an existing meeting. **This action finds the meeting using the attendee's name or email.**
+              Parameters: {{"attendee": "string, the name or email of a person in the meeting (e.g., 'Kishan')", "new_start_time": "ISO 8601 datetime", "new_end_time": "ISO 8601 datetime"}}
             - "check_availability": Checks if attendees are free.
               Parameters: {{"attendees": ["list_of_emails"], "start_time": "ISO 8601 datetime", "end_time": "ISO 8601 datetime"}}
+            - "list_upcoming_meetings": Lists all upcoming meetings.
+              Parameters: {{}}
+            - "cancel_meeting": Cancels a meeting. Finds meetings by time and/or attendee.
+              Parameters: {{"start_time": "ISO 8601 datetime (start of search window)", "end_time": "ISO 8601 datetime (end of search window, optional)", "attendee": "string_identifier (optional)"}}
         - "email_agent":
             - "send_email": Sends an email.
               Parameters: {{"recipients": ["list_of_emails"], "subject": "string", "body": "string"}}
@@ -126,29 +149,34 @@ class GeminiCore(BaseAgent):
                     "parameters": {{
                         "attendees": ["$contact_agent.email"],
                         "title": "Project Updates",
-                        "start_time": "[Calculated ISO 8601 for tomorrow at 2 PM]",
-                        "end_time": "[Calculated ISO 8601 for tomorrow at 3 PM]",
+                        "start_time": "2025-11-11T08:30:00Z", // 2:00 PM IST converted to UTC
+                        "end_time": "2025-11-11T09:30:00Z", // 3:00 PM IST converted to UTC
                         "description": "Project updates meeting."
                     }}
                 }}
             ]
         }}
 
-        User Request: "Email Bob Williams about the new deadline. Subject: Deadline Update. Body: Hi Bob, the new deadline is next Friday."
+        User Request: "Email Sehal and Kishan about the new deadline. Subject: Deadlines."
         {{
             "steps": [
                 {{
                     "agent": "contact_agent",
                     "action": "find_contact",
-                    "parameters": {{"identifier": "Bob Williams"}}
+                    "parameters": {{"identifier": "Sehal"}}
+                }},
+                {{
+                    "agent": "contact_agent",
+                    "action": "find_contact",
+                    "parameters": {{"identifier": "Kishan"}}
                 }},
                 {{
                     "agent": "email_agent",
                     "action": "send_email",
                     "parameters": {{
-                        "recipients": ["$contact_agent.email"],
-                        "subject": "Deadline Update",
-                        "body": "Hi Bob, the new deadline is next Friday."
+                        "recipients": ["$sehal_email", "$kishan_email"],
+                        "subject": "Deadlines",
+                        "body": "Hi both, the new deadline is next Friday."
                     }}
                 }}
             ]
@@ -162,15 +190,15 @@ class GeminiCore(BaseAgent):
                     "action": "reschedule_meeting",
                     "parameters": {{
                         "attendee": "Alice Johnson",
-                        "new_start_time": "[Calculated ISO 8601 for next Monday at 10 AM]",
-                        "new_end_time": "[Calculated ISO 8601 for next Monday at 11 AM]"
+                        "new_start_time": "2025-11-17T04:30:00Z", // 10:00 AM IST converted to UTC
+                        "new_end_time": "2025-11-17T05:30:00Z"  // 11:00 AM IST converted to UTC
                     }}
                 }}
             ]
         }}
 
-        --- User Request ---
-        "{request}"
+        --- Current User Request ---
+        "{current_request}"
 
         --- JSON Plan ---
         """
@@ -195,7 +223,7 @@ class GeminiCore(BaseAgent):
         except (json.JSONDecodeError, AttributeError) as e:
             self.logger.error(f"Failed to parse Gemini response as JSON. Error: {e}")
             self.logger.debug(f"Raw model response text: {response.text}")
-            return {} # Return empty dict on failure
+            return {{}} # Return empty dict on failure
 
     async def _execute_task_plan(self, task_plan: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -233,10 +261,39 @@ class GeminiCore(BaseAgent):
                 # Store the result for potential use in subsequent steps
                 # We use a generic key like "email" or "event_id" which should be consistent in agent responses
                 if response_data.get("status") == "success" and "data" in response_data:
-                    # Find a suitable key to store the result. Let's assume agents return a primary result.
+                    # Find a suitable key to store the result (e.g., 'email', 'event_id')
                     result_key = self._extract_result_key(response_data["data"])
-                    if result_key:
-                        context[f"{agent_name}.{result_key}"] = response_data["data"][result_key]
+                    
+                    if result_key: # We must have a result to store
+                        result_value = response_data["data"][result_key]
+                        
+                        # -- NEW CONTEXT LOGIC --
+                        # Check if this was a contact_agent search
+                        if agent_name == "contact_agent" and action == "find_contact" and result_key == "email":
+                            # Use the identifier to create a unique context key
+                            # This matches the model's observed behavior of creating keys like '$sehal_email'
+                            try:
+                                identifier = resolved_parameters.get("identifier", "").lower()
+                                # Clean the identifier (basic cleaning, removes spaces/symbols)
+                                cleaned_identifier = ''.join(e for e in identifier if e.isalnum())
+                                
+                                if cleaned_identifier:
+                                    custom_key = f"{cleaned_identifier}_email"
+                                    context[custom_key] = result_value
+                                    self.logger.debug(f"Stored contact result in context: {custom_key} = {result_value}")
+                                else:
+                                    self.logger.warning("Contact agent identifier was empty, cannot create unique context key.")
+                            except Exception as e:
+                                self.logger.error(f"Error creating unique context key: {e}")
+                        # -- END NEW CONTEXT LOGIC --
+
+                        # Fallback for other agents OR if custom key creation failed
+                        # We also *still* store the default key.
+                        # This allows single contacts to work and provides a fallback.
+                        context_key = f"{agent_name}.{result_key}"
+                        if context_key not in context: # Only set if not already set by a more specific key
+                            context[context_key] = result_value
+                            self.logger.debug(f"Stored default result in context: {context_key} = {result_value}")
 
                 results[f"step_{i+1}"] = response_data
 
@@ -320,18 +377,25 @@ class GeminiCore(BaseAgent):
             print("Invalid input.")
             return None
 
-    async def _generate_response(self, original_request: str, execution_results: Dict[str, Any]) -> str:
+    async def _generate_response(self, history: List[Dict[str, str]], execution_results: Dict[str, Any]) -> str:
         """
         Generate a final, natural language response based on the execution results.
         """
+        # Format the full history for the model
+        history_string = "\n".join([f"{msg['role']}: {msg['parts']}" for msg in history])
+        
         prompt = f"""
-        Based on the original request and the execution results, generate a helpful and natural-sounding response for the user.
+        You are a helpful AI assistant. Based on the *entire* conversation history and the results of the *latest* action, generate a helpful and natural-sounding response for the user.
 
-        Original Request: "{original_request}"
-        Execution Results: {json.dumps(execution_results, indent=2)}
+        --- Conversation History ---
+        {history_string}
+
+        --- Execution Results (for the latest user request) ---
+        {json.dumps(execution_results, indent=2)}
 
         Analyze the results. If there were errors, explain them simply. If everything was successful, confirm what was done.
         Do not mention "steps", "agents", or "JSON". Just provide a clear, user-friendly summary.
+        Be concise and directly answer the user's last message.
         """
         response = self.model.generate_content(prompt)
         return response.text.strip()
